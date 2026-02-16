@@ -11,6 +11,8 @@ import {
 import { transcribeVideoBuffer } from '@/lib/transcribe';
 import { chunkAndTranscribeStream } from '@/lib/chunkTranscribe';
 import { scoreTranscript } from '@/lib/scoreTranscript';
+import { identifySpeakers, formatTaggedTranscript, TaggedSegment } from '@/lib/identifySpeakers';
+import path from 'path';
 
 export const runtime = 'nodejs';
 
@@ -42,6 +44,42 @@ function formatTranscriptText(transcript: any): string {
   }
 
   return JSON.stringify(transcript);
+}
+
+const SUPPORTED_EXTENSIONS = new Set([
+  '.flac',
+  '.m4a',
+  '.mp3',
+  '.mp4',
+  '.mpeg',
+  '.mpga',
+  '.oga',
+  '.ogg',
+  '.wav',
+  '.webm',
+]);
+
+const SUPPORTED_MIME_TYPES = new Set([
+  'audio/flac',
+  'audio/m4a',
+  'audio/mp3',
+  'audio/mpeg',
+  'audio/mp4',
+  'audio/ogg',
+  'audio/oga',
+  'audio/wav',
+  'audio/x-wav',
+  'audio/webm',
+  'video/mp4',
+  'video/mpeg',
+  'video/webm',
+]);
+
+function isWhisperSupportedFile(name?: string, mimeType?: string): boolean {
+  if (mimeType && SUPPORTED_MIME_TYPES.has(mimeType.toLowerCase())) return true;
+  if (!name) return false;
+  const ext = path.extname(name).toLowerCase();
+  return SUPPORTED_EXTENSIONS.has(ext);
 }
 
 export async function POST(req: Request) {
@@ -101,7 +139,9 @@ export async function POST(req: Request) {
 
     const maxBytes = 25 * 1024 * 1024;
     const declaredSize = metadata.size ? Number(metadata.size) : undefined;
-    const shouldChunk = declaredSize ? declaredSize > maxBytes : true;
+    const isSupported = isWhisperSupportedFile(metadata.name, metadata.mimeType);
+    const isVideo = typeof metadata.mimeType === 'string' && metadata.mimeType.startsWith('video/');
+    const shouldChunk = isVideo || !isSupported || (declaredSize ? declaredSize > maxBytes : true);
 
     let transcript;
 
@@ -167,15 +207,36 @@ export async function POST(req: Request) {
       }
     }
     const formattedTranscript = formatTranscriptText(transcript);
+
+    // Identify speakers (CSM vs CLIENT) using GPT
+    let taggedSegments: TaggedSegment[] | undefined;
+    let taggedTranscript: string | undefined;
+    try {
+      taggedSegments = await identifySpeakers(formattedTranscript);
+      taggedTranscript = formatTaggedTranscript(taggedSegments);
+    } catch (err) {
+      console.error('Speaker identification failed', (err as Error).message);
+      taggedSegments = undefined;
+      taggedTranscript = undefined;
+    }
+
+    // Score using the speaker-tagged transcript if available, otherwise plain
+    const transcriptForScoring = taggedTranscript || formattedTranscript;
     let score;
     try {
-      score = await scoreTranscript(formattedTranscript);
+      score = await scoreTranscript(transcriptForScoring);
     } catch (err) {
       console.error('Scoring failed', (err as Error).message);
       score = undefined;
     }
 
-    return NextResponse.json({ file: metadata, transcript, formattedTranscript, score });
+    return NextResponse.json({
+      file: metadata,
+      transcript,
+      formattedTranscript: taggedTranscript || formattedTranscript,
+      taggedSegments,
+      score,
+    });
   } catch (err) {
     return NextResponse.json({ error: 'Unexpected server error.' }, { status: 500 });
   }

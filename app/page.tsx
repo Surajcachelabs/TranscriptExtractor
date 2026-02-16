@@ -33,6 +33,12 @@ interface ScoreResult {
   raw?: string;
 }
 
+interface TaggedSegment {
+  timestamp: string;
+  speaker: 'CSM' | 'CLIENT' | 'UNKNOWN';
+  text: string;
+}
+
 interface TranscribeResponse {
   file: {
     id: string;
@@ -42,6 +48,7 @@ interface TranscribeResponse {
   };
   transcript: any;
   formattedTranscript?: string;
+  taggedSegments?: TaggedSegment[];
   score?: ScoreResult;
   error?: string;
 }
@@ -170,7 +177,59 @@ export default function HomePage() {
             )}
           </div>
           <div style={{ fontWeight: 700, fontSize: 16, marginTop: 8 }}>Transcript</div>
-          {transcriptLines.length > 0 ? (
+          {result.taggedSegments && result.taggedSegments.length > 0 ? (
+            <div
+              className="transcript"
+              style={{ whiteSpace: 'pre-wrap', lineHeight: 1.55, padding: '6px 0' }}
+            >
+              {result.taggedSegments.map((seg: TaggedSegment, idx: number) => {
+                const isCSM = seg.speaker === 'CSM';
+                const isClient = seg.speaker === 'CLIENT';
+                const speakerColor = isCSM ? '#60a5fa' : isClient ? '#f59e0b' : '#94a3b8';
+                const speakerBg = isCSM
+                  ? 'rgba(96, 165, 250, 0.12)'
+                  : isClient
+                    ? 'rgba(245, 158, 11, 0.12)'
+                    : 'rgba(148, 163, 184, 0.08)';
+                const borderLeft = `3px solid ${speakerColor}`;
+                return (
+                  <div
+                    key={idx}
+                    style={{
+                      padding: '10px 14px',
+                      borderBottom:
+                        idx === result.taggedSegments!.length - 1
+                          ? 'none'
+                          : '1px solid var(--divider)',
+                      background: speakerBg,
+                      borderLeft,
+                    }}
+                  >
+                    <span
+                      style={{
+                        color: 'var(--text-muted)',
+                        fontSize: 13,
+                        marginRight: 8,
+                      }}
+                    >
+                      {seg.timestamp}
+                    </span>
+                    <span
+                      style={{
+                        color: speakerColor,
+                        fontWeight: 700,
+                        fontSize: 13,
+                        marginRight: 8,
+                      }}
+                    >
+                      {seg.speaker}:
+                    </span>
+                    <span style={{ color: 'var(--text-primary)' }}>{seg.text}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : transcriptLines.length > 0 ? (
             <div
               className="transcript"
               style={{ whiteSpace: 'pre-wrap', lineHeight: 1.55, padding: '6px 0' }}
