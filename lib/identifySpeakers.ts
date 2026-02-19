@@ -6,6 +6,20 @@ export interface TaggedSegment {
   text: string;
 }
 
+export interface DiarizedUtterance {
+  start: number;
+  end: number;
+  text: string;
+  speakerId: string;
+}
+
+type ParsedLine = {
+  index: number;
+  timestamp: string;
+  text: string;
+  raw: string;
+};
+
 const SPEAKER_ID_SYSTEM_PROMPT = `You are an expert conversation analyst. Your task is to label each line of a timestamped transcript with the correct speaker tag: CSM or CLIENT.
 
 Use the following hierarchical logic:
@@ -49,26 +63,139 @@ Example:
 
 Do NOT include any other text, explanation, or markdown. Only the JSON array.`;
 
-/**
- * Takes a formatted transcript (timestamped lines) and uses GPT to identify
- * each line's speaker as CSM or CLIENT.
- */
-export async function identifySpeakers(formattedTranscript: string): Promise<TaggedSegment[]> {
-  if (!process.env.OPENAI_API_KEY) {
-    throw new Error('Server misconfiguration: OPENAI_API_KEY is missing.');
-  }
+const DIARIZATION_SYSTEM_PROMPT = `You are a conversation diarization assistant working from timestamped transcript text.
 
-  const lines = formattedTranscript
+Goal:
+- Assign each line to a stable speaker identity: "S1", "S2", or "UNKNOWN".
+- Keep speaker identity consistent across the full conversation.
+
+Rules:
+- Prefer only two speakers unless evidence strongly suggests otherwise.
+- Do NOT assign CSM/CLIENT roles yet.
+- If a line is truly ambiguous, use "UNKNOWN".
+- Use context from surrounding turns to maintain continuity.
+
+Output:
+Return ONLY a valid JSON array of objects:
+[{"line":1,"speakerId":"S1"},{"line":2,"speakerId":"S2"}]
+
+No prose, no markdown.`;
+
+const ROLE_MAP_SYSTEM_PROMPT = `You are a QA role-mapping assistant.
+
+Given stable speaker IDs (S1, S2) and each speaker's sampled utterances, map each speaker ID to one role: CSM, CLIENT, or UNKNOWN.
+
+Rules:
+- Use conversation authority, guidance language, and question/answer dynamics.
+- Exactly one of S1/S2 can be CSM and the other CLIENT when evidence is sufficient.
+- If evidence is insufficient for a speaker, assign UNKNOWN.
+
+Output:
+Return ONLY JSON object with keys for provided IDs.
+Example: {"S1":"CLIENT","S2":"CSM"}
+
+No prose, no markdown.`;
+
+function parseTranscriptLines(formattedTranscript: string): ParsedLine[] {
+  const rawLines = formattedTranscript
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean);
 
-  if (lines.length === 0) return [];
+  return rawLines.map((line, index) => {
+    const tsMatch = line.match(/^\[([^\]]+)\]\s*(.*)/);
+    return {
+      index: index + 1,
+      timestamp: tsMatch ? `[${tsMatch[1]}]` : '',
+      text: tsMatch ? tsMatch[2] : line,
+      raw: line,
+    };
+  });
+}
 
-  // Build numbered lines for GPT
-  const numberedLines = lines.map((l, i) => `${i + 1}. ${l}`).join('\n');
+function stripJsonFences(input: string): string {
+  return input.replace(/```json?\s*/gi, '').replace(/```/g, '').trim();
+}
 
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+function normalizeRole(value: unknown): 'CSM' | 'CLIENT' | 'UNKNOWN' {
+  if (value === 'CSM') return 'CSM';
+  if (value === 'CLIENT') return 'CLIENT';
+  return 'UNKNOWN';
+}
+
+function normalizeSpeakerId(value: unknown): 'S1' | 'S2' | 'UNKNOWN' {
+  if (typeof value !== 'string') return 'UNKNOWN';
+  const normalized = value.trim().toUpperCase();
+  if (normalized === 'S1' || normalized === 'SPEAKER_1' || normalized === 'SPEAKER1') return 'S1';
+  if (normalized === 'S2' || normalized === 'SPEAKER_2' || normalized === 'SPEAKER2') return 'S2';
+  return 'UNKNOWN';
+}
+
+function secondsToTimestamp(seconds?: number) {
+  if (typeof seconds !== 'number' || Number.isNaN(seconds)) return '00:00';
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.round(seconds - mins * 60)
+    .toString()
+    .padStart(2, '0');
+  return `${mins.toString().padStart(2, '0')}:${secs}`;
+}
+
+function canonicalSpeakerId(value: string, remap: Map<string, 'S1' | 'S2'>): 'S1' | 'S2' | 'UNKNOWN' {
+  const normalized = normalizeSpeakerId(value);
+  if (normalized !== 'UNKNOWN') return normalized;
+
+  const raw = value.trim();
+  if (!raw) return 'UNKNOWN';
+
+  if (remap.has(raw)) {
+    return remap.get(raw)!;
+  }
+
+  if (remap.size >= 2) return 'UNKNOWN';
+  const assigned = remap.size === 0 ? 'S1' : 'S2';
+  remap.set(raw, assigned);
+  return assigned;
+}
+
+async function mapSpeakerIdsToRoles(
+  linesBySpeaker: { S1: string[]; S2: string[] },
+  openai: OpenAI
+): Promise<Record<'S1' | 'S2', 'CSM' | 'CLIENT' | 'UNKNOWN'>> {
+  const roleMapInput = {
+    speakers: [
+      {
+        speakerId: 'S1',
+        sampleUtterances: linesBySpeaker.S1,
+        sampleCount: linesBySpeaker.S1.length,
+      },
+      {
+        speakerId: 'S2',
+        sampleUtterances: linesBySpeaker.S2,
+        sampleCount: linesBySpeaker.S2.length,
+      },
+    ],
+  };
+
+  const roleCompletion = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0,
+    messages: [
+      { role: 'system', content: ROLE_MAP_SYSTEM_PROMPT },
+      { role: 'user', content: JSON.stringify(roleMapInput) },
+    ],
+  });
+
+  const roleReply = roleCompletion.choices[0]?.message?.content ?? '';
+  const roleParsed = JSON.parse(stripJsonFences(roleReply)) as Record<string, unknown>;
+
+  return {
+    S1: normalizeRole(roleParsed.S1),
+    S2: normalizeRole(roleParsed.S2),
+  };
+}
+
+async function identifySpeakersDirect(lines: ParsedLine[], openai: OpenAI): Promise<TaggedSegment[]> {
+  const numberedLines = lines.map((l) => `${l.index}. ${l.raw}`).join('\n');
 
   const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
@@ -80,42 +207,142 @@ export async function identifySpeakers(formattedTranscript: string): Promise<Tag
   });
 
   const reply = completion.choices[0]?.message?.content ?? '';
+  const cleaned = stripJsonFences(reply);
+  const parsed = JSON.parse(cleaned) as Array<{ line: number; speaker: string }>;
 
-  // Parse the JSON array from GPT's reply
-  let speakerMap: Array<{ line: number; speaker: string }> = [];
-  try {
-    // Strip potential markdown fencing
-    const cleaned = reply.replace(/```json?\s*/gi, '').replace(/```/g, '').trim();
-    speakerMap = JSON.parse(cleaned);
-  } catch {
-    console.error('Failed to parse speaker identification JSON:', reply);
-    // Fallback: return lines without speaker tags
-    return lines.map((l) => {
-      const tsMatch = l.match(/^\[([^\]]+)\]\s*(.*)/);
-      return {
-        timestamp: tsMatch ? `[${tsMatch[1]}]` : '',
-        speaker: 'UNKNOWN' as const,
-        text: tsMatch ? tsMatch[2] : l,
-      };
-    });
-  }
-
-  // Build a lookup from line number -> speaker
   const speakerByLine = new Map<number, 'CSM' | 'CLIENT' | 'UNKNOWN'>();
-  for (const entry of speakerMap) {
-    const speaker =
-      entry.speaker === 'CSM' ? 'CSM' : entry.speaker === 'CLIENT' ? 'CLIENT' : 'UNKNOWN';
-    speakerByLine.set(entry.line, speaker);
+  for (const entry of parsed) {
+    speakerByLine.set(entry.line, normalizeRole(entry.speaker));
   }
 
-  return lines.map((l, i) => {
-    const tsMatch = l.match(/^\[([^\]]+)\]\s*(.*)/);
+  return lines.map((line) => ({
+    timestamp: line.timestamp,
+    speaker: speakerByLine.get(line.index) ?? 'UNKNOWN',
+    text: line.text,
+  }));
+}
+
+async function identifySpeakersStable(lines: ParsedLine[], openai: OpenAI): Promise<TaggedSegment[]> {
+  const numberedLines = lines.map((l) => `${l.index}. ${l.raw}`).join('\n');
+
+  const diarizationCompletion = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0,
+    messages: [
+      { role: 'system', content: DIARIZATION_SYSTEM_PROMPT },
+      { role: 'user', content: numberedLines },
+    ],
+  });
+
+  const diarizationReply = diarizationCompletion.choices[0]?.message?.content ?? '';
+  const diarizationParsed = JSON.parse(stripJsonFences(diarizationReply)) as Array<{
+    line: number;
+    speakerId: string;
+  }>;
+
+  const speakerIdByLine = new Map<number, 'S1' | 'S2' | 'UNKNOWN'>();
+  for (const entry of diarizationParsed) {
+    speakerIdByLine.set(entry.line, normalizeSpeakerId(entry.speakerId));
+  }
+
+  const groupedBySpeaker = {
+    S1: [] as string[],
+    S2: [] as string[],
+  };
+
+  for (const line of lines) {
+    const speakerId = speakerIdByLine.get(line.index) ?? 'UNKNOWN';
+    if (speakerId === 'S1' || speakerId === 'S2') {
+      if (groupedBySpeaker[speakerId].length < 40) {
+        groupedBySpeaker[speakerId].push(line.text);
+      }
+    }
+  }
+
+  const roleBySpeakerId = await mapSpeakerIdsToRoles(groupedBySpeaker, openai);
+
+  return lines.map((line) => {
+    const speakerId = speakerIdByLine.get(line.index) ?? 'UNKNOWN';
+    const speakerRole = speakerId === 'UNKNOWN' ? 'UNKNOWN' : roleBySpeakerId[speakerId];
     return {
-      timestamp: tsMatch ? `[${tsMatch[1]}]` : '',
-      speaker: speakerByLine.get(i + 1) ?? 'UNKNOWN',
-      text: tsMatch ? tsMatch[2] : l,
+      timestamp: line.timestamp,
+      speaker: speakerRole,
+      text: line.text,
     };
   });
+}
+
+export async function identifySpeakersFromDiarizedUtterances(
+  utterances: DiarizedUtterance[]
+): Promise<TaggedSegment[]> {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('Server misconfiguration: OPENAI_API_KEY is missing.');
+  }
+
+  if (!Array.isArray(utterances) || utterances.length === 0) {
+    return [];
+  }
+
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+  const speakerRemap = new Map<string, 'S1' | 'S2'>();
+  const groupedBySpeaker = {
+    S1: [] as string[],
+    S2: [] as string[],
+  };
+
+  const utterancesWithCanonical = utterances.map((utt) => {
+    const canonicalId = canonicalSpeakerId(utt.speakerId, speakerRemap);
+    if ((canonicalId === 'S1' || canonicalId === 'S2') && groupedBySpeaker[canonicalId].length < 50) {
+      groupedBySpeaker[canonicalId].push(utt.text);
+    }
+    return { ...utt, canonicalId };
+  });
+
+  const roleBySpeakerId = await mapSpeakerIdsToRoles(groupedBySpeaker, openai);
+
+  return utterancesWithCanonical.map((utt) => {
+    const speaker = utt.canonicalId === 'UNKNOWN' ? 'UNKNOWN' : roleBySpeakerId[utt.canonicalId];
+    const start = secondsToTimestamp(utt.start);
+    const end = secondsToTimestamp(utt.end);
+    return {
+      timestamp: `[${start} - ${end}]`,
+      speaker,
+      text: utt.text,
+    };
+  });
+}
+
+/**
+ * Takes a formatted transcript (timestamped lines) and uses GPT to identify
+ * each line's speaker as CSM or CLIENT.
+ */
+export async function identifySpeakers(formattedTranscript: string): Promise<TaggedSegment[]> {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('Server misconfiguration: OPENAI_API_KEY is missing.');
+  }
+
+  const lines = parseTranscriptLines(formattedTranscript);
+
+  if (lines.length === 0) return [];
+
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+  try {
+    return await identifySpeakersStable(lines, openai);
+  } catch (stableErr) {
+    console.error('Stable speaker-role pipeline failed, falling back to direct classifier:', stableErr);
+    try {
+      return await identifySpeakersDirect(lines, openai);
+    } catch (directErr) {
+      console.error('Direct speaker identification failed:', directErr);
+      return lines.map((line) => ({
+        timestamp: line.timestamp,
+        speaker: 'UNKNOWN',
+        text: line.text,
+      }));
+    }
+  }
 }
 
 /**

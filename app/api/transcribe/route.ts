@@ -11,7 +11,13 @@ import {
 import { transcribeVideoBuffer } from '@/lib/transcribe';
 import { chunkAndTranscribeStream } from '@/lib/chunkTranscribe';
 import { scoreTranscript } from '@/lib/scoreTranscript';
-import { identifySpeakers, formatTaggedTranscript, TaggedSegment } from '@/lib/identifySpeakers';
+import {
+  identifySpeakers,
+  identifySpeakersFromDiarizedUtterances,
+  formatTaggedTranscript,
+  TaggedSegment,
+} from '@/lib/identifySpeakers';
+import { transcribeAndDiarizeBuffer } from '@/lib/deepgramTranscribe';
 import path from 'path';
 
 export const runtime = 'nodejs';
@@ -140,15 +146,15 @@ export async function POST(req: Request) {
     const maxBytes = 25 * 1024 * 1024;
     const declaredSize = metadata.size ? Number(metadata.size) : undefined;
     const isSupported = isWhisperSupportedFile(metadata.name, metadata.mimeType);
-    const isVideo = typeof metadata.mimeType === 'string' && metadata.mimeType.startsWith('video/');
-    const shouldChunk = isVideo || !isSupported || (declaredSize ? declaredSize > maxBytes : true);
+    const shouldChunk = !isSupported || (declaredSize ? declaredSize > maxBytes : true);
 
     let transcript;
+    let downloadedBuffer: Buffer | undefined;
+    let acousticTaggedSegments: TaggedSegment[] | undefined;
 
     if (!shouldChunk) {
-      let buffer: Buffer;
       try {
-        buffer = await downloadDriveFile(fileId, accessToken);
+        downloadedBuffer = await downloadDriveFile(fileId, accessToken);
       } catch (err) {
         const status = (err as DriveApiError).status;
         const details = (err as DriveApiError).body;
@@ -165,8 +171,24 @@ export async function POST(req: Request) {
         );
       }
 
+      if (process.env.DEEPGRAM_API_KEY && downloadedBuffer) {
+        try {
+          const deepgramResult = await transcribeAndDiarizeBuffer(
+            downloadedBuffer,
+            metadata.mimeType ?? undefined
+          );
+          acousticTaggedSegments = await identifySpeakersFromDiarizedUtterances(
+            deepgramResult.utterances
+          );
+        } catch (err) {
+          console.error('Acoustic diarization failed; falling back to text classifier', {
+            error: (err as Error).message,
+          });
+        }
+      }
+
       try {
-        transcript = await transcribeVideoBuffer(buffer, metadata.name ?? 'video');
+        transcript = await transcribeVideoBuffer(downloadedBuffer, metadata.name ?? 'video');
       } catch (err) {
         const anyErr = err as any;
         const message = anyErr?.message || 'Transcription failed, please try again.';
@@ -206,22 +228,27 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: message, details }, { status });
       }
     }
-    const formattedTranscript = formatTranscriptText(transcript);
+    const baseFormattedTranscript = formatTranscriptText(transcript);
 
     // Identify speakers (CSM vs CLIENT) using GPT
     let taggedSegments: TaggedSegment[] | undefined;
     let taggedTranscript: string | undefined;
-    try {
-      taggedSegments = await identifySpeakers(formattedTranscript);
-      taggedTranscript = formatTaggedTranscript(taggedSegments);
-    } catch (err) {
-      console.error('Speaker identification failed', (err as Error).message);
-      taggedSegments = undefined;
-      taggedTranscript = undefined;
+    if (acousticTaggedSegments?.length) {
+      taggedSegments = acousticTaggedSegments;
+      taggedTranscript = formatTaggedTranscript(acousticTaggedSegments);
+    } else {
+      try {
+        taggedSegments = await identifySpeakers(baseFormattedTranscript);
+        taggedTranscript = formatTaggedTranscript(taggedSegments);
+      } catch (err) {
+        console.error('Speaker identification failed', (err as Error).message);
+        taggedSegments = undefined;
+        taggedTranscript = undefined;
+      }
     }
 
     // Score using the speaker-tagged transcript if available, otherwise plain
-    const transcriptForScoring = taggedTranscript || formattedTranscript;
+    const transcriptForScoring = taggedTranscript || baseFormattedTranscript;
     let score;
     try {
       score = await scoreTranscript(transcriptForScoring);
@@ -233,7 +260,7 @@ export async function POST(req: Request) {
     return NextResponse.json({
       file: metadata,
       transcript,
-      formattedTranscript: taggedTranscript || formattedTranscript,
+      formattedTranscript: taggedTranscript || baseFormattedTranscript,
       taggedSegments,
       score,
     });
