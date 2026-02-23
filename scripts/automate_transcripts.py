@@ -4,13 +4,15 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import requests
 from openpyxl import Workbook, load_workbook
 
 
-DEFAULT_INPUT = Path('Data/sample_input.xlsx')
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+DEFAULT_INPUT = PROJECT_ROOT / 'Data' / 'sample_input.xlsx'
 DEFAULT_BASE_URL = 'http://localhost:3000'
 
 
@@ -167,15 +169,23 @@ def build_session(base_url: str, cookie_input: str) -> requests.Session:
 
 
 def transcribe_link(session: requests.Session, base_url: str, drive_url: str, timeout_sec: int) -> Tuple[str, str]:
-    resp = session.post(
-        f'{base_url}/api/transcribe',
-        json={'driveUrl': drive_url},
-        timeout=timeout_sec,
-    )
+    try:
+        resp = session.post(
+            f'{base_url}/api/transcribe',
+            json={'driveUrl': drive_url},
+            timeout=timeout_sec,
+        )
+    except requests.exceptions.Timeout:
+        return '', f'Request timed out after {timeout_sec}s'
+    except requests.exceptions.RequestException as exc:
+        return '', f'Request failed: {exc}'
 
     content_type = resp.headers.get('content-type', '')
     if 'application/json' in content_type.lower():
-        payload = resp.json()
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {'error': resp.text}
     else:
         payload = {'error': resp.text}
 
@@ -190,15 +200,20 @@ def transcribe_link(session: requests.Session, base_url: str, drive_url: str, ti
     return transcript, ''
 
 
-def write_output(output_path: Path, rows: List[Tuple[str, str, str]]) -> None:
+def initialize_output(output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
     ws = wb.active
     ws.title = 'Output'
     ws.append(['CSM Team Member', 'Video Link', 'Transcript'])
 
-    for row in rows:
-        ws.append(list(row))
+    wb.save(output_path)
 
+
+def append_output_row(output_path: Path, row: Tuple[str, str, str]) -> None:
+    wb = load_workbook(output_path)
+    ws = wb.active
+    ws.append(list(row))
     wb.save(output_path)
 
 
@@ -217,7 +232,7 @@ def main() -> int:
         return 2
 
     base_url = args.base_url.rstrip('/')
-    output = args.output or Path('Data') / f"transcripts_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    output = args.output or PROJECT_ROOT / 'Data' / f"transcripts_output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
     try:
         records = read_input_rows(args.input)
@@ -235,7 +250,7 @@ def main() -> int:
         print(f'ERROR creating authenticated session: {exc}', file=sys.stderr)
         return 2
 
-    output_rows: List[Tuple[str, str, str]] = []
+    initialize_output(output)
 
     total = len(records)
     for idx, (member, link) in enumerate(records, start=1):
@@ -243,12 +258,10 @@ def main() -> int:
         transcript, err = transcribe_link(session, base_url, link, args.timeout)
         if err:
             transcript = f'ERROR: {err}'
-        output_rows.append((member, link, transcript))
+        append_output_row(output, (member, link, transcript))
         if idx < total and args.sleep > 0:
             time.sleep(args.sleep)
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    write_output(output, output_rows)
     print(f'Done. Output saved to: {output}')
     return 0
 
