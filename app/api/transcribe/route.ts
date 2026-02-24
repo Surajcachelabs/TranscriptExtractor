@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getServerSession } from 'next-auth';
 import authOptions from '../auth/[...nextauth]/authOptions';
+import OpenAI from 'openai';
 import {
   downloadDriveFile,
   downloadDriveFileStream,
@@ -21,6 +22,82 @@ import { transcribeAndDiarizeBuffer } from '@/lib/deepgramTranscribe';
 import path from 'path';
 
 export const runtime = 'nodejs';
+
+function sanitizeToEnglishAscii(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/[^\u0009\u0020-\u007E]/g, '').replace(/\s+/g, ' ').trim())
+    .filter((line) => line.length > 0)
+    .join('\n')
+    .trim();
+}
+
+async function enforceEnglishTranscript(text: string): Promise<string> {
+  const input = typeof text === 'string' ? text.trim() : '';
+  if (!input) return '';
+
+  if (!process.env.OPENAI_API_KEY) {
+    return sanitizeToEnglishAscii(input);
+  }
+
+  try {
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0,
+      messages: [
+        {
+          role: 'system',
+          content: [
+            'You convert transcripts to strictly English output.',
+            'Rules:',
+            '- Translate all non-English content into natural English.',
+            '- Keep the same line order and line count.',
+            '- Preserve timestamps exactly, e.g. [00:01 - 00:05].',
+            '- Preserve speaker labels exactly when present (CSM:, CLIENT:, UNKNOWN:).',
+            '- Return plain text only. No markdown or commentary.',
+          ].join('\n'),
+        },
+        { role: 'user', content: input },
+      ],
+    });
+
+    const translated = completion.choices[0]?.message?.content?.trim() || input;
+    const sanitized = sanitizeToEnglishAscii(translated);
+    return sanitized || sanitizeToEnglishAscii(input);
+  } catch (err) {
+    console.error('English normalization failed; returning sanitized transcript', (err as Error).message);
+    return sanitizeToEnglishAscii(input);
+  }
+}
+
+function parseTaggedTranscriptToSegments(
+  transcript: string
+): Array<{ timestamp: string; speaker: 'CSM' | 'CLIENT' | 'UNKNOWN'; text: string }> {
+  if (!transcript) return [];
+
+  return transcript
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = line.match(/^(?:\[(.*?)\]\s*)?(CSM|CLIENT|UNKNOWN):\s*(.*)$/);
+      if (!match) {
+        return {
+          timestamp: '',
+          speaker: 'UNKNOWN' as const,
+          text: line,
+        };
+      }
+
+      const [, rawTimestamp, rawSpeaker, rawText] = match;
+      return {
+        timestamp: rawTimestamp ? `[${rawTimestamp}]` : '',
+        speaker: rawSpeaker as 'CSM' | 'CLIENT' | 'UNKNOWN',
+        text: (rawText || '').trim(),
+      };
+    });
+}
 
 function secondsToTimestamp(seconds?: number) {
   if (typeof seconds !== 'number' || Number.isNaN(seconds)) return '';
@@ -248,7 +325,24 @@ export async function POST(req: Request) {
     }
 
     // Score using the speaker-tagged transcript if available, otherwise plain
-    const transcriptForScoring = taggedTranscript || baseFormattedTranscript;
+    const transcriptForScoringRaw = taggedTranscript || baseFormattedTranscript;
+    const englishTranscript = await enforceEnglishTranscript(transcriptForScoringRaw);
+
+    const transcriptForScoring = englishTranscript || transcriptForScoringRaw;
+    let responseTaggedSegments = taggedSegments;
+
+    if (taggedSegments?.length) {
+      const englishTaggedSegments = parseTaggedTranscriptToSegments(transcriptForScoring);
+      if (englishTaggedSegments.length === taggedSegments.length) {
+        responseTaggedSegments = taggedSegments.map((seg, idx) => ({
+          ...seg,
+          timestamp: englishTaggedSegments[idx]?.timestamp || seg.timestamp,
+          speaker: englishTaggedSegments[idx]?.speaker || seg.speaker,
+          text: englishTaggedSegments[idx]?.text || seg.text,
+        }));
+      }
+    }
+
     let score;
     try {
       score = await scoreTranscript(transcriptForScoring);
@@ -260,8 +354,8 @@ export async function POST(req: Request) {
     return NextResponse.json({
       file: metadata,
       transcript,
-      formattedTranscript: taggedTranscript || baseFormattedTranscript,
-      taggedSegments,
+      formattedTranscript: transcriptForScoring,
+      taggedSegments: responseTaggedSegments,
       score,
     });
   } catch (err) {

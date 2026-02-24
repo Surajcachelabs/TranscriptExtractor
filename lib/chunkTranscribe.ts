@@ -21,8 +21,7 @@ async function resolveFfmpegPath(): Promise<string> {
 
   try {
     // Prefer the module-resolved binary path
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const mod = require('ffmpeg-static');
+    const mod = (await import('ffmpeg-static')).default;
     if (typeof mod === 'string' && mod.length > 0) {
       candidates.push(mod);
     }
