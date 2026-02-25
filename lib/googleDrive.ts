@@ -18,6 +18,25 @@ export class DriveApiError extends Error {
   }
 }
 
+async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3, baseDelayMs = 2000): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      const status = (err as DriveApiError).status;
+      // Only retry on transient / rate-limit errors
+      const isRetryable = !status || status === 429 || status >= 500;
+      if (!isRetryable || attempt === maxAttempts) throw err;
+      const delay = baseDelayMs * Math.pow(2, attempt - 1);
+      console.warn(`Google Drive request failed (${status || 'network'}), retrying in ${delay}ms (${attempt}/${maxAttempts})...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastError;
+}
+
 export function extractFileIdFromDriveUrl(url: string): string | null {
   if (!url) return null;
   try {
@@ -44,41 +63,45 @@ export async function getDriveFileMetadata(
   fileId: string,
   accessToken: string
 ): Promise<DriveFileMetadata> {
-  const response = await fetch(`${DRIVE_BASE}/${fileId}?fields=id,name,mimeType,size`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-    cache: 'no-store',
+  return withRetry(async () => {
+    const response = await fetch(`${DRIVE_BASE}/${fileId}?fields=id,name,mimeType,size`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+      cache: 'no-store',
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new DriveApiError('Failed to fetch file metadata from Google Drive', response.status, body);
+    }
+
+    return (await response.json()) as DriveFileMetadata;
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new DriveApiError('Failed to fetch file metadata from Google Drive', response.status, body);
-  }
-
-  return (await response.json()) as DriveFileMetadata;
 }
 
 export async function downloadDriveFile(
   fileId: string,
   accessToken: string
 ): Promise<Buffer> {
-  const response = await fetch(`${DRIVE_BASE}/${fileId}?alt=media`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-    cache: 'no-store',
+  return withRetry(async () => {
+    const response = await fetch(`${DRIVE_BASE}/${fileId}?alt=media`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+      cache: 'no-store',
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new DriveApiError('Failed to download file content from Google Drive', response.status, body);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer);
   });
-
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new DriveApiError('Failed to download file content from Google Drive', response.status, body);
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  return Buffer.from(arrayBuffer);
 }
 
 import { Readable } from 'stream';
@@ -88,18 +111,19 @@ export async function downloadDriveFileStream(
   fileId: string,
   accessToken: string
 ): Promise<Readable> {
-  const response = await fetch(`${DRIVE_BASE}/${fileId}?alt=media`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-    cache: 'no-store',
-  });
+  return withRetry(async () => {
+    const response = await fetch(`${DRIVE_BASE}/${fileId}?alt=media`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+      cache: 'no-store',
+    });
 
-  if (!response.ok) {
-    const body = await response.text().catch(() => '');
-    throw new DriveApiError('Failed to download file content from Google Drive', response.status, body);
-  }
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new DriveApiError('Failed to download file content from Google Drive', response.status, body);
+    }
 
   const webStream = response.body;
   if (!webStream) {
@@ -131,4 +155,5 @@ export async function downloadDriveFileStream(
     const message = err instanceof Error ? err.message : 'Unknown stream conversion error';
     throw new DriveApiError(`Failed to convert Drive response to stream: ${message}`, response.status);
   }
+  });
 }

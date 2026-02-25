@@ -10,7 +10,7 @@ import {
   DriveApiError,
 } from '@/lib/googleDrive';
 import { transcribeVideoBuffer } from '@/lib/transcribe';
-import { chunkAndTranscribeStream } from '@/lib/chunkTranscribe';
+import { chunkAndTranscribeStream, extractAudioBuffer } from '@/lib/chunkTranscribe';
 import { scoreTranscript } from '@/lib/scoreTranscript';
 import {
   identifySpeakers,
@@ -20,6 +20,7 @@ import {
 } from '@/lib/identifySpeakers';
 import { transcribeAndDiarizeBuffer } from '@/lib/deepgramTranscribe';
 import path from 'path';
+import { Readable } from 'stream';
 
 export const runtime = 'nodejs';
 
@@ -223,7 +224,10 @@ export async function POST(req: Request) {
     const maxBytes = 25 * 1024 * 1024;
     const declaredSize = metadata.size ? Number(metadata.size) : undefined;
     const isSupported = isWhisperSupportedFile(metadata.name, metadata.mimeType);
-    const shouldChunk = !isSupported || (declaredSize ? declaredSize > maxBytes : true);
+    const isVideoFile = metadata.mimeType?.startsWith('video/');
+    // Always chunk video files — raw video containers often cause Whisper decode errors,
+    // and ffmpeg-extracted WAV can exceed 25 MB even for small MP4s.
+    const shouldChunk = isVideoFile || !isSupported || (declaredSize ? declaredSize > maxBytes : true);
 
     let transcript;
     let downloadedBuffer: Buffer | undefined;
@@ -264,8 +268,18 @@ export async function POST(req: Request) {
         }
       }
 
+      // Pre-process: extract audio via ffmpeg so Whisper always receives a clean WAV.
+      let whisperBuffer = downloadedBuffer;
+      let whisperFileName = metadata.name ?? 'video';
       try {
-        transcript = await transcribeVideoBuffer(downloadedBuffer, metadata.name ?? 'video');
+        whisperBuffer = await extractAudioBuffer(downloadedBuffer);
+        whisperFileName = 'audio.wav';
+      } catch (extractErr) {
+        console.warn('ffmpeg audio extraction failed; sending original buffer', (extractErr as Error).message);
+      }
+
+      try {
+        transcript = await transcribeVideoBuffer(whisperBuffer, whisperFileName);
       } catch (err) {
         const anyErr = err as any;
         const message = anyErr?.message || 'Transcription failed, please try again.';
@@ -275,23 +289,46 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: message, details }, { status });
       }
     } else {
-      let stream: import('stream').Readable;
-      try {
-        stream = await downloadDriveFileStream(fileId, accessToken);
-      } catch (err) {
-        const status = (err as DriveApiError).status;
-        const details = (err as DriveApiError).body;
-        console.error('Stream download failed', { status, details, fileId, error: (err as Error).message });
-        if (status === 403 || status === 404) {
+      // Run Deepgram diarization if configured (download buffer for it)
+      if (process.env.DEEPGRAM_API_KEY) {
+        try {
+          downloadedBuffer = await downloadDriveFile(fileId, accessToken);
+          const deepgramResult = await transcribeAndDiarizeBuffer(
+            downloadedBuffer,
+            metadata.mimeType ?? undefined
+          );
+          acousticTaggedSegments = await identifySpeakersFromDiarizedUtterances(
+            deepgramResult.utterances
+          );
+        } catch (err) {
+          console.error('Acoustic diarization failed in chunked path; falling back to text classifier', {
+            error: (err as Error).message,
+          });
+        }
+      }
+
+      let stream: Readable;
+      if (downloadedBuffer) {
+        // Reuse the already-downloaded buffer instead of fetching again
+        stream = Readable.from(downloadedBuffer);
+      } else {
+        try {
+          stream = await downloadDriveFileStream(fileId, accessToken);
+        } catch (err) {
+          const status = (err as DriveApiError).status;
+          const details = (err as DriveApiError).body;
+          console.error('Stream download failed', { status, details, fileId, error: (err as Error).message });
+          if (status === 403 || status === 404) {
+            return NextResponse.json(
+              { error: 'You do not have access to this file or it does not exist.', details },
+              { status: 403 }
+            );
+          }
           return NextResponse.json(
-            { error: 'You do not have access to this file or it does not exist.', details },
-            { status: 403 }
+            { error: 'Failed to download the file from Google Drive.', details },
+            { status: 500 }
           );
         }
-        return NextResponse.json(
-          { error: 'Failed to download the file from Google Drive.', details },
-          { status: 500 }
-        );
       }
 
       try {

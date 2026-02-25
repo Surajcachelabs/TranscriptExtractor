@@ -29,7 +29,7 @@ def main() -> int:
         choices=['auto', 'edge', 'chrome', 'firefox', 'brave', 'chromium', 'opera'],
         help='Browser used for Google sign-in (default: auto).',
     )
-    parser.add_argument('--timeout', type=int, default=600, help='Timeout in seconds per transcription request.')
+    parser.add_argument('--timeout', type=int, default=1800, help='Timeout in seconds per transcription request (default: 30 minutes).')
     parser.add_argument('--sleep', type=float, default=0.5, help='Sleep seconds between requests.')
     args = parser.parse_args()
 

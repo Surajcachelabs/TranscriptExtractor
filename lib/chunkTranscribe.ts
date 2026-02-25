@@ -10,7 +10,7 @@ import { toFile } from 'openai/uploads';
 
 let cachedFfmpegPath: string | null = null;
 
-async function resolveFfmpegPath(): Promise<string> {
+export async function resolveFfmpegPath(): Promise<string> {
   if (cachedFfmpegPath) return cachedFfmpegPath;
 
   const candidates: string[] = [];
@@ -73,10 +73,80 @@ interface CombinedTranscript {
   chunkCount: number;
 }
 
+/**
+ * Converts any audio/video buffer to a 16 kHz mono WAV buffer using ffmpeg.
+ * This ensures the data sent to Whisper is always in a clean, supported format.
+ */
+export async function extractAudioBuffer(inputBuffer: Buffer): Promise<Buffer> {
+  const ffmpegPath = await resolveFfmpegPath();
+  if (!ffmpegPath) {
+    throw new Error('FFmpeg binary could not be resolved. Install ffmpeg or set FFMPEG_PATH.');
+  }
+
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'whisper-extract-'));
+  const srcPath = path.join(tmpDir, 'source.bin');
+  const outPath = path.join(tmpDir, 'audio.wav');
+
+  try {
+    await fs.writeFile(srcPath, inputBuffer);
+
+    await new Promise<void>((resolve, reject) => {
+      const args = [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-y',
+        '-i', srcPath,
+        '-vn',           // drop video
+        '-ac', '1',      // mono
+        '-ar', '16000',  // 16 kHz
+        '-f', 'wav',
+        outPath,
+      ];
+      const proc = spawn(ffmpegPath, args, { stdio: ['ignore', 'inherit', 'inherit'] });
+      proc.on('error', reject);
+      proc.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg audio extraction exited with code ${code}`));
+      });
+    });
+
+    const output = await fs.readFile(outPath);
+    if (output.byteLength < 1024) {
+      throw new Error('ffmpeg produced an empty or too-small audio file; the source may have no audio track.');
+    }
+    return output;
+  } finally {
+    // Cleanup temp files
+    await fs.unlink(srcPath).catch(() => undefined);
+    await fs.unlink(outPath).catch(() => undefined);
+    await fs.rmdir(tmpDir).catch(() => undefined);
+  }
+}
+
 // At 16kHz mono PCM (~256 kbps), 300s ≈ ~9.6 MB; stays well under 24MB target.
 const CHUNK_SECONDS = 300;
 const MAX_BYTES = 24 * 1024 * 1024;
 const MIN_CHUNK_BYTES = 2 * 1024; // ignore tiny/empty chunks
+
+async function whisperWithRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err: any) {
+      lastError = err;
+      const status = err?.status ?? err?.response?.status;
+      // Retry on transient errors (429 rate limit, 5xx server errors)
+      // Do NOT retry on 400 (bad request) — the file itself is the problem
+      const isRetryable = status === 429 || (typeof status === 'number' && status >= 500);
+      if (!isRetryable || attempt === maxAttempts) throw err;
+      const delay = 2000 * Math.pow(2, attempt - 1);
+      console.warn(`Whisper API error (${status}), retrying in ${delay}ms (${attempt}/${maxAttempts})...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastError;
+}
 
 /**
  * Streams a media file into ffmpeg, produces WAV chunks, transcribes each chunk with Whisper,
@@ -149,13 +219,15 @@ export async function chunkAndTranscribeStream(stream: Readable, fileName: strin
     }
 
     const data = await fs.readFile(fullPath);
-    const fileLike = await toFile(data, `${fileName || 'chunk'}.wav`);
 
-    const result = (await openai.audio.transcriptions.create({
-      file: fileLike,
-      model: 'whisper-1',
-      response_format: 'verbose_json',
-    })) as ChunkTranscript;
+    const result = await whisperWithRetry(async () => {
+      const fileLike = await toFile(data, `${fileName || 'chunk'}.wav`);
+      return (await openai.audio.transcriptions.create({
+        file: fileLike,
+        model: 'whisper-1',
+        response_format: 'verbose_json',
+      })) as ChunkTranscript;
+    });
 
     if (!language && result.language) language = result.language;
     if (typeof result.duration === 'number') {

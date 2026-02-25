@@ -17,14 +17,24 @@ export async function transcribeVideoBuffer(buffer: Buffer, fileName: string) {
 
   const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-  // Convert the in-memory buffer into a File-like object for the OpenAI SDK.
-  const file = await toFile(buffer, fileName || 'video.mp4');
-
-  const transcript = await openai.audio.transcriptions.create({
-    file,
-    model: 'whisper-1',
-    response_format: 'verbose_json',
-  });
-
-  return transcript;
+  // Retry on transient errors (429 rate limit, 5xx server errors)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const file = await toFile(buffer, fileName || 'video.mp4');
+      const transcript = await openai.audio.transcriptions.create({
+        file,
+        model: 'whisper-1',
+        response_format: 'verbose_json',
+      });
+      return transcript;
+    } catch (err: any) {
+      const status = err?.status ?? err?.response?.status;
+      const isRetryable = status === 429 || (typeof status === 'number' && status >= 500);
+      if (!isRetryable || attempt === 3) throw err;
+      const delay = 2000 * Math.pow(2, attempt - 1);
+      console.warn(`Whisper API error (${status}), retrying in ${delay}ms (${attempt}/3)...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw new Error('Transcription failed after all retry attempts');
 }

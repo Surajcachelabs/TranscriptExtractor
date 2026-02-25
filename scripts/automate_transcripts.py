@@ -169,35 +169,57 @@ def build_session(base_url: str, cookie_input: str) -> requests.Session:
 
 
 def transcribe_link(session: requests.Session, base_url: str, drive_url: str, timeout_sec: int) -> Tuple[str, str]:
-    try:
-        resp = session.post(
-            f'{base_url}/api/transcribe',
-            json={'driveUrl': drive_url},
-            timeout=timeout_sec,
-        )
-    except requests.exceptions.Timeout:
-        return '', f'Request timed out after {timeout_sec}s'
-    except requests.exceptions.RequestException as exc:
-        return '', f'Request failed: {exc}'
-
-    content_type = resp.headers.get('content-type', '')
-    if 'application/json' in content_type.lower():
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
         try:
-            payload = resp.json()
-        except ValueError:
+            resp = session.post(
+                f'{base_url}/api/transcribe',
+                json={'driveUrl': drive_url},
+                timeout=timeout_sec,
+            )
+        except requests.exceptions.Timeout:
+            if attempt < max_retries:
+                wait = 15 * attempt
+                print(f'  Timeout on attempt {attempt}/{max_retries}, retrying in {wait}s...')
+                time.sleep(wait)
+                continue
+            return '', f'Request timed out after {timeout_sec}s (all {max_retries} attempts)'
+        except requests.exceptions.RequestException as exc:
+            if attempt < max_retries:
+                wait = 15 * attempt
+                print(f'  Request error on attempt {attempt}/{max_retries}: {exc}, retrying in {wait}s...')
+                time.sleep(wait)
+                continue
+            return '', f'Request failed: {exc}'
+
+        content_type = resp.headers.get('content-type', '')
+        if 'application/json' in content_type.lower():
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = {'error': resp.text}
+        else:
             payload = {'error': resp.text}
-    else:
-        payload = {'error': resp.text}
 
-    if resp.status_code != 200:
-        error = payload.get('error') if isinstance(payload, dict) else str(payload)
-        return '', f'HTTP {resp.status_code}: {error or "Unknown error"}'
+        # Retry on transient server errors (5xx)
+        if resp.status_code >= 500 and attempt < max_retries:
+            error = payload.get('error') if isinstance(payload, dict) else str(payload)
+            wait = 15 * attempt
+            print(f'  Server error ({resp.status_code}) on attempt {attempt}/{max_retries}: {error}, retrying in {wait}s...')
+            time.sleep(wait)
+            continue
 
-    transcript = extract_transcript_text(payload if isinstance(payload, dict) else {})
-    if not transcript:
-        return '', 'No transcript text returned.'
+        if resp.status_code != 200:
+            error = payload.get('error') if isinstance(payload, dict) else str(payload)
+            return '', f'HTTP {resp.status_code}: {error or "Unknown error"}'
 
-    return transcript, ''
+        transcript = extract_transcript_text(payload if isinstance(payload, dict) else {})
+        if not transcript:
+            return '', 'No transcript text returned.'
+
+        return transcript, ''
+
+    return '', 'All retry attempts exhausted.'
 
 
 def initialize_output(output_path: Path) -> None:
@@ -223,7 +245,7 @@ def main() -> int:
     parser.add_argument('--output', type=Path, default=None, help='Path to output Excel file.')
     parser.add_argument('--base-url', default=DEFAULT_BASE_URL, help='Website base URL (default: http://localhost:3000).')
     parser.add_argument('--cookie', default=os.getenv('NEXTAUTH_COOKIE', ''), help='Session cookie string or token.')
-    parser.add_argument('--timeout', type=int, default=600, help='Timeout in seconds per transcription request.')
+    parser.add_argument('--timeout', type=int, default=1800, help='Timeout in seconds per transcription request (default: 30 minutes).')
     parser.add_argument('--sleep', type=float, default=0.5, help='Sleep seconds between requests.')
     args = parser.parse_args()
 
